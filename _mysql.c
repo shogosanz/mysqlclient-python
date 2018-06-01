@@ -100,6 +100,123 @@ static int _mysql_server_init_done = 0;
 #define HAVE_MYSQL_OPT_TIMEOUTS 1
 #endif
 
+
+// for connection pool
+#include <pthread.h>
+#ifdef __linux__
+#include "queue.h"
+#else
+#include <sys/queue.h>
+#endif
+
+typedef struct pooled_con {
+	TAILQ_ENTRY(pooled_con) link;
+	char*	host;
+	char*	user;
+	char* 	passwd;
+	char*	db;
+	unsigned int port;
+	char*	unix_socket;
+	unsigned int client_flag;
+	MYSQL*	con;
+}pooled_con_t, *pooled_con_ptr;
+
+struct pooled_instance {
+	pthread_mutex_t mtx;
+	TAILQ_HEAD(conns, pooled_con) conns;
+};
+static struct pooled_instance	_pooled_instance;
+
+static void _init_pooled_con(void){
+	pthread_mutex_init(&_pooled_instance.mtx, NULL);
+	TAILQ_INIT(&_pooled_instance.conns);
+}
+static int _add_pooled_con(
+	MYSQL* con,
+	const char* host,
+	const char* user,
+	const char* passwd,
+	const char* db,
+	unsigned int port,
+	const char* unix_socket,
+	unsigned int client_flag){
+	//
+	struct pooled_con *pcon = (struct pooled_con*)malloc(sizeof(struct pooled_con));
+	if (!pcon){
+		return(-1);
+	}
+	bzero(pcon, sizeof(*pcon));
+	pcon->con			= con;
+	pcon->host			= strdup(host?host:"");
+	pcon->user  		= strdup(user?user:"");
+	pcon->passwd  		= strdup(passwd?passwd:"");
+	pcon->db  			= strdup(db?db:"");
+	pcon->port  		= port;
+	pcon->unix_socket  	= strdup(unix_socket?unix_socket:"");
+	pcon->client_flag  	= client_flag;
+	//
+	pthread_mutex_lock(&_pooled_instance.mtx);
+	TAILQ_INSERT_TAIL(&_pooled_instance.conns, pcon, link);
+	pthread_mutex_unlock(&_pooled_instance.mtx);
+	return(0);
+}
+static void _remove_all_pooled_con(void){
+	pthread_mutex_lock(&_pooled_instance.mtx);
+	struct pooled_con *p1 = TAILQ_FIRST(&_pooled_instance.conns);
+	while(p1 != NULL){
+		struct pooled_con *p2 = TAILQ_NEXT(p1, link);
+		if (p1->con){
+			if (p1->host){ free(p1->host); }
+			if (p1->user){ free(p1->user); }
+			if (p1->passwd){ free(p1->passwd); }
+			if (p1->db){ free(p1->db); }
+			if (p1->unix_socket){ free(p1->unix_socket); }
+			//
+			mysql_close(p1->con);
+		}
+		free(p1);
+		p1 = p2;
+	}
+	pthread_mutex_unlock(&_pooled_instance.mtx);
+}
+
+static MYSQL* _ref_pooled_con(
+	const char* host,
+	const char* user,
+	const char* passwd,
+	const char* db,
+	unsigned int port,
+	const char* unix_socket,
+	unsigned int client_flag){
+	//
+	MYSQL* con = NULL;
+	struct pooled_con *it,*next;
+	pthread_mutex_lock(&_pooled_instance.mtx);
+	// プロパティリストを走査
+	if (!TAILQ_EMPTY(&_pooled_instance.conns)){
+		TAILQ_FOREACH_SAFE(it, &_pooled_instance.conns, link, next) {
+			if (strcmp(it->host, host?host:"") == 0 &&
+				strcmp(it->user, user?user:"") == 0 &&
+				strcmp(it->passwd, passwd?passwd:"") == 0 &&
+				strcmp(it->db, db?db:"") == 0 &&
+				it->port == port &&
+				strcmp(it->unix_socket, unix_socket?unix_socket:"") == 0 &&
+				it->client_flag == client_flag) {
+				//
+				con = it->con;
+				pthread_mutex_unlock(&_pooled_instance.mtx);
+				return(con);
+			}
+		}
+	}
+	pthread_mutex_unlock(&_pooled_instance.mtx);
+	//
+	return(NULL);
+}
+
+// end of conenction pool
+
+
 PyObject *
 _mysql_Exception(_mysql_ConnectionObject *c)
 {
@@ -517,6 +634,7 @@ _mysql_ConnectionObject_Initialize(
 	int read_timeout = 0;
 	int write_timeout = 0;
 #endif
+	int	skip_connect = 0;
 	int compress = -1, named_pipe = -1, local_infile = -1;
 	char *init_command=NULL,
 	     *read_default_file=NULL,
@@ -572,6 +690,26 @@ _mysql_ConnectionObject_Initialize(
 		return -1;
 #endif
 	}
+	// referenced by connection pool.
+	Py_BEGIN_ALLOW_THREADS ;
+	//
+	conn = _ref_pooled_con(
+		host,
+		user,
+		passwd,
+		db,
+		port,
+		unix_socket,
+		client_flag
+	);
+	if (conn){
+		skip_connect++;
+	}
+	Py_END_ALLOW_THREADS ;
+	if (skip_connect){
+		goto RESUME_CON;
+	}
+
 
 	Py_BEGIN_ALLOW_THREADS ;
 	conn = mysql_init(&(self->connection));
@@ -633,7 +771,7 @@ _mysql_ConnectionObject_Initialize(
 		_mysql_Exception(self);
 		return -1;
 	}
-
+RESUME_CON:
 	/* Internal references to python-land objects */
 	if (!conv)
 		conv = PyDict_New();
@@ -651,6 +789,13 @@ _mysql_ConnectionObject_Initialize(
 	  however.
 	*/
 	self->open = 1;
+
+	// add connection pool
+	Py_BEGIN_ALLOW_THREADS ;
+	if (!skip_connect){
+		_add_pooled_con(conn, host, user, passwd, db, port, unix_socket, client_flag);
+	}
+	Py_END_ALLOW_THREADS ;
 	return 0;
 }
 
@@ -763,7 +908,7 @@ _mysql_ConnectionObject_close(
 {
 	if (self->open) {
 		Py_BEGIN_ALLOW_THREADS
-		mysql_close(&(self->connection));
+//		mysql_close(&(self->connection));
 		Py_END_ALLOW_THREADS
 		self->open = 0;
 	} else {
@@ -2134,7 +2279,7 @@ _mysql_ConnectionObject_dealloc(
 {
 	PyObject_GC_UnTrack(self);
 	if (self->open) {
-		mysql_close(&(self->connection));
+//		mysql_close(&(self->connection));
 		self->open = 0;
 	}
 	Py_CLEAR(self->converter);
@@ -2908,6 +3053,8 @@ init_mysql(void)
 	if (!(_mysql_NULL = PyString_FromString("NULL")))
 		goto error;
 	if (PyDict_SetItemString(dict, "NULL", _mysql_NULL)) goto error;
+
+	_init_pooled_con();
   error:
 	if (PyErr_Occurred()) {
 		PyErr_SetString(PyExc_ImportError,
